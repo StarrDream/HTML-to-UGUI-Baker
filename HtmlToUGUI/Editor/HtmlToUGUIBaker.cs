@@ -4,6 +4,7 @@ using UnityEngine.UI;
 using TMPro;
 using System.IO;
 using System.Collections.Generic;
+using Newtonsoft.Json;
 
 namespace Editor.UIBaker
 {
@@ -52,6 +53,10 @@ namespace Editor.UIBaker
         private const string PREFS_CONFIG_PATH_KEY = "HtmlToUGUIBaker_ConfigPath";
         private const string PREFS_RES_INDEX_KEY = "HtmlToUGUIBaker_ResIndex";
 
+        // 文本组件偏好配置
+        private bool useLegacyText = false;
+        private const string PREFS_USE_LEGACY_TEXT_KEY = "HtmlToUGUIBaker_UseLegacyText";
+
         // 用于在当前窗口内嵌绘制 SO 属性的序列化对象
         private SerializedObject configSO;
         private SerializedProperty resolutionsProp;
@@ -64,7 +69,6 @@ namespace Editor.UIBaker
 
         private void OnEnable()
         {
-            // 初始化时读取本地缓存的工具路径、配置文件路径与选择的分辨率索引
             converterUrl = EditorPrefs.GetString(PREFS_URL_KEY, "");
             string configPath = EditorPrefs.GetString(PREFS_CONFIG_PATH_KEY, "");
             if (!string.IsNullOrEmpty(configPath))
@@ -73,6 +77,7 @@ namespace Editor.UIBaker
             }
 
             selectedResolutionIndex = EditorPrefs.GetInt(PREFS_RES_INDEX_KEY, 0);
+            useLegacyText = EditorPrefs.GetBool(PREFS_USE_LEGACY_TEXT_KEY, false);
         }
 
         private void OnGUI()
@@ -84,8 +89,16 @@ namespace Editor.UIBaker
             DrawExternalToolchainUI();
 
             targetCanvas = (Canvas)EditorGUILayout.ObjectField("目标 Canvas", targetCanvas, typeof(Canvas), true);
-            GUILayout.Space(10);
 
+            GUILayout.Space(5);
+            EditorGUI.BeginChangeCheck();
+            useLegacyText = EditorGUILayout.Toggle("使用旧版 Text (Legacy)", useLegacyText);
+            if (EditorGUI.EndChangeCheck())
+            {
+                EditorPrefs.SetBool(PREFS_USE_LEGACY_TEXT_KEY, useLegacyText);
+            }
+
+            GUILayout.Space(10);
             currentMode = (InputMode)GUILayout.Toolbar((int)currentMode, new string[] { "读取 JSON 文件", "直接粘贴 JSON 字符" });
             GUILayout.Space(10);
 
@@ -110,34 +123,33 @@ namespace Editor.UIBaker
 
         #region UI 绘制逻辑
 
-        /// <summary>
-        /// 渲染分辨率配置与 DSL 文档生成 UI
-        /// </summary>
         private void DrawConfigUI()
         {
             GUILayout.Label("多分辨率与 DSL 配置", EditorStyles.label);
             GUILayout.BeginVertical("box");
 
             EditorGUI.BeginChangeCheck();
-            config = (HtmlToUGUIConfig)EditorGUILayout.ObjectField("配置文件 (SO)", config, typeof(HtmlToUGUIConfig), false);
+            config = (HtmlToUGUIConfig)EditorGUILayout.ObjectField("配置文件 (SO)", config, typeof(HtmlToUGUIConfig),
+                false);
             if (EditorGUI.EndChangeCheck())
             {
                 string path = config != null ? AssetDatabase.GetAssetPath(config) : "";
                 EditorPrefs.SetString(PREFS_CONFIG_PATH_KEY, path);
                 selectedResolutionIndex = 0;
                 EditorPrefs.SetInt(PREFS_RES_INDEX_KEY, selectedResolutionIndex);
-                configSO = null; // 切换配置时清空序列化缓存
+                configSO = null;
             }
 
             if (config == null)
             {
-                EditorGUILayout.HelpBox("请先创建并分配 HtmlToUGUIConfig 配置文件。\n(右键 Project 窗口 -> Create -> UI Architecture -> HtmlToUGUI Config)", MessageType.Warning);
+                EditorGUILayout.HelpBox(
+                    "请先创建并分配 HtmlToUGUIConfig 配置文件。\n(右键 Project 窗口 -> Create -> UI Architecture -> HtmlToUGUI Config)",
+                    MessageType.Warning);
                 GUILayout.EndVertical();
                 GUILayout.Space(10);
                 return;
             }
 
-            // 引入 SerializedObject 以便在编辑器窗口内直接绘制和修改 SO 的数组，实现就地拓展分辨率
             if (configSO == null || configSO.targetObject != config)
             {
                 configSO = new SerializedObject(config);
@@ -160,7 +172,6 @@ namespace Editor.UIBaker
                 return;
             }
 
-            // 防御性处理：防止删减列表项导致缓存的索引越界
             selectedResolutionIndex = Mathf.Clamp(selectedResolutionIndex, 0, config.supportedResolutions.Count - 1);
             string[] resNames = new string[config.supportedResolutions.Count];
             for (int i = 0; i < config.supportedResolutions.Count; i++)
@@ -260,8 +271,8 @@ namespace Editor.UIBaker
             }
 
             Vector2 res = config.supportedResolutions[selectedResolutionIndex].resolution;
-            // 读取 TextAsset 内容并动态替换模板中的分辨率占位符
-            string dsl = config.dslTemplateAsset.text.Replace("{WIDTH}", res.x.ToString()).Replace("{HEIGHT}", res.y.ToString());
+            string dsl = config.dslTemplateAsset.text.Replace("{WIDTH}", res.x.ToString())
+                .Replace("{HEIGHT}", res.y.ToString());
             GUIUtility.systemCopyBuffer = dsl;
             Debug.Log($"[HtmlToUGUIBaker] 已成功复制分辨率为 {res.x}x{res.y} 的 DSL 规范文档到剪贴板。");
         }
@@ -310,6 +321,7 @@ namespace Editor.UIBaker
             }
 
             string jsonContent = string.Empty;
+
             if (currentMode == InputMode.FileAsset)
             {
                 if (jsonAsset == null)
@@ -333,10 +345,20 @@ namespace Editor.UIBaker
 
             ConfigureCanvasScaler(targetCanvas);
 
-            UIDataNode rootNode = JsonUtility.FromJson<UIDataNode>(jsonContent);
+            UIDataNode rootNode = null;
+            try
+            {
+                rootNode = JsonConvert.DeserializeObject<UIDataNode>(jsonContent);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"[HtmlToUGUIBaker] 烘焙中断: JSON 解析异常，错误信息: {e.Message}");
+                return;
+            }
+
             if (rootNode == null)
             {
-                Debug.LogError("[HtmlToUGUIBaker] 烘焙中断: JSON 解析失败，请检查数据格式是否符合规范。");
+                Debug.LogError("[HtmlToUGUIBaker] 烘焙中断: JSON 解析结果为空，请检查数据格式是否符合规范。");
                 return;
             }
 
@@ -354,9 +376,9 @@ namespace Editor.UIBaker
 
             scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
 
-            // 动态应用 SO 中选定的分辨率
             Vector2 targetRes = new Vector2(1920, 1080);
-            if (config != null && config.supportedResolutions != null && config.supportedResolutions.Count > selectedResolutionIndex)
+            if (config != null && config.supportedResolutions != null &&
+                config.supportedResolutions.Count > selectedResolutionIndex)
             {
                 targetRes = config.supportedResolutions[selectedResolutionIndex].resolution;
             }
@@ -381,6 +403,7 @@ namespace Editor.UIBaker
 
             float localX = nodeData.x - parentAbsX;
             float localY = nodeData.y - parentAbsY;
+
             rect.anchoredPosition = new Vector2(localX, -localY);
             rect.sizeDelta = new Vector2(nodeData.width, nodeData.height);
 
@@ -402,7 +425,6 @@ namespace Editor.UIBaker
             Color bgColor = ParseHexColor(nodeData.color, Color.white);
             Color fontColor = ParseHexColor(nodeData.fontColor, Color.black);
             int fontSize = nodeData.fontSize > 0 ? nodeData.fontSize : 24;
-            TextAlignmentOptions alignment = ParseTextAlign(nodeData.textAlign);
             bool isMultiLine = nodeData.height > (fontSize * 1.5f);
 
             switch (nodeData.type.ToLower())
@@ -415,14 +437,29 @@ namespace Editor.UIBaker
                     return go.transform;
 
                 case "text":
-                    TextMeshProUGUI txt = go.AddComponent<TextMeshProUGUI>();
-                    txt.text = nodeData.text;
-                    txt.color = fontColor;
-                    txt.fontSize = fontSize;
-                    txt.alignment = alignment;
-                    txt.enableWordWrapping = isMultiLine;
-                    txt.overflowMode = isMultiLine ? TextOverflowModes.Truncate : TextOverflowModes.Overflow;
-                    txt.raycastTarget = false;
+                    if (useLegacyText)
+                    {
+                        Text txt = go.AddComponent<Text>();
+                        txt.text = nodeData.text;
+                        txt.color = fontColor;
+                        txt.fontSize = fontSize;
+                        txt.alignment = ParseLegacyTextAlign(nodeData.textAlign);
+                        txt.horizontalOverflow = isMultiLine ? HorizontalWrapMode.Wrap : HorizontalWrapMode.Overflow;
+                        txt.verticalOverflow = isMultiLine ? VerticalWrapMode.Truncate : VerticalWrapMode.Overflow;
+                        txt.raycastTarget = false;
+                    }
+                    else
+                    {
+                        TextMeshProUGUI txt = go.AddComponent<TextMeshProUGUI>();
+                        txt.text = nodeData.text;
+                        txt.color = fontColor;
+                        txt.fontSize = fontSize;
+                        txt.alignment = ParseTextAlign(nodeData.textAlign);
+                        txt.enableWordWrapping = isMultiLine;
+                        txt.overflowMode = isMultiLine ? TextOverflowModes.Truncate : TextOverflowModes.Overflow;
+                        txt.raycastTarget = false;
+                    }
+
                     return go.transform;
 
                 case "button":
@@ -431,48 +468,93 @@ namespace Editor.UIBaker
                     Button btn = go.AddComponent<Button>();
                     btn.targetGraphic = btnImg;
 
-                    GameObject btnTxtGo = CreateChildRect(go, "Text (TMP)", Vector2.zero, Vector2.one);
-                    TextMeshProUGUI btnTxt = btnTxtGo.AddComponent<TextMeshProUGUI>();
-                    btnTxt.text = nodeData.text;
-                    btnTxt.color = fontColor;
-                    btnTxt.fontSize = fontSize;
-                    btnTxt.alignment = alignment;
-                    btnTxt.enableWordWrapping = false;
-                    btnTxt.overflowMode = TextOverflowModes.Overflow;
-                    btnTxt.raycastTarget = false;
+                    GameObject btnTxtGo = CreateChildRect(go, useLegacyText ? "Text" : "Text (TMP)", Vector2.zero,
+                        Vector2.one);
+                    if (useLegacyText)
+                    {
+                        Text btnTxt = btnTxtGo.AddComponent<Text>();
+                        btnTxt.text = nodeData.text;
+                        btnTxt.color = fontColor;
+                        btnTxt.fontSize = fontSize;
+                        btnTxt.alignment = ParseLegacyTextAlign(nodeData.textAlign);
+                        btnTxt.horizontalOverflow = HorizontalWrapMode.Overflow;
+                        btnTxt.verticalOverflow = VerticalWrapMode.Overflow;
+                        btnTxt.raycastTarget = false;
+                    }
+                    else
+                    {
+                        TextMeshProUGUI btnTxt = btnTxtGo.AddComponent<TextMeshProUGUI>();
+                        btnTxt.text = nodeData.text;
+                        btnTxt.color = fontColor;
+                        btnTxt.fontSize = fontSize;
+                        btnTxt.alignment = ParseTextAlign(nodeData.textAlign);
+                        btnTxt.enableWordWrapping = false;
+                        btnTxt.overflowMode = TextOverflowModes.Overflow;
+                        btnTxt.raycastTarget = false;
+                    }
+
                     return go.transform;
 
                 case "input":
                     Image inputBg = go.AddComponent<Image>();
                     inputBg.color = bgColor;
-                    TMP_InputField inputField = go.AddComponent<TMP_InputField>();
-                    inputField.targetGraphic = inputBg;
 
-                    GameObject textAreaGo = CreateChildRect(go, "Text Area", Vector2.zero, Vector2.one, new Vector2(10, 5), new Vector2(-10, -5));
+                    GameObject textAreaGo = CreateChildRect(go, "Text Area", Vector2.zero, Vector2.one,
+                        new Vector2(10, 5), new Vector2(-10, -5));
                     textAreaGo.AddComponent<RectMask2D>();
 
                     GameObject phGo = CreateChildRect(textAreaGo, "Placeholder", Vector2.zero, Vector2.one);
-                    TextMeshProUGUI phTxt = phGo.AddComponent<TextMeshProUGUI>();
-                    phTxt.text = nodeData.text;
+                    GameObject textGo = CreateChildRect(textAreaGo, "Text", Vector2.zero, Vector2.one);
+
                     Color phColor = fontColor;
                     phColor.a = 0.5f;
-                    phTxt.color = phColor;
-                    phTxt.fontSize = fontSize;
-                    phTxt.alignment = alignment;
-                    phTxt.enableWordWrapping = false;
-                    phTxt.raycastTarget = false;
 
-                    GameObject textGo = CreateChildRect(textAreaGo, "Text", Vector2.zero, Vector2.one);
-                    TextMeshProUGUI inTxt = textGo.AddComponent<TextMeshProUGUI>();
-                    inTxt.color = fontColor;
-                    inTxt.fontSize = fontSize;
-                    inTxt.alignment = alignment;
-                    inTxt.enableWordWrapping = false;
-                    inTxt.raycastTarget = false;
+                    if (useLegacyText)
+                    {
+                        InputField inputField = go.AddComponent<InputField>();
+                        inputField.targetGraphic = inputBg;
 
-                    inputField.textViewport = textAreaGo.GetComponent<RectTransform>();
-                    inputField.textComponent = inTxt;
-                    inputField.placeholder = phTxt;
+                        Text phTxt = phGo.AddComponent<Text>();
+                        phTxt.text = nodeData.text;
+                        phTxt.color = phColor;
+                        phTxt.fontSize = fontSize;
+                        phTxt.alignment = ParseLegacyTextAlign(nodeData.textAlign);
+                        phTxt.raycastTarget = false;
+
+                        Text inTxt = textGo.AddComponent<Text>();
+                        inTxt.color = fontColor;
+                        inTxt.fontSize = fontSize;
+                        inTxt.alignment = ParseLegacyTextAlign(nodeData.textAlign);
+                        inTxt.raycastTarget = false;
+
+                        inputField.textComponent = inTxt;
+                        inputField.placeholder = phTxt;
+                    }
+                    else
+                    {
+                        TMP_InputField inputField = go.AddComponent<TMP_InputField>();
+                        inputField.targetGraphic = inputBg;
+
+                        TextMeshProUGUI phTxt = phGo.AddComponent<TextMeshProUGUI>();
+                        phTxt.text = nodeData.text;
+                        phTxt.color = phColor;
+                        phTxt.fontSize = fontSize;
+                        phTxt.alignment = ParseTextAlign(nodeData.textAlign);
+                        phTxt.enableWordWrapping = false;
+                        phTxt.raycastTarget = false;
+
+                        TextMeshProUGUI inTxt = textGo.AddComponent<TextMeshProUGUI>();
+                        inTxt.color = fontColor;
+                        inTxt.fontSize = fontSize;
+                        inTxt.alignment = ParseTextAlign(nodeData.textAlign);
+                        inTxt.enableWordWrapping = false;
+                        inTxt.raycastTarget = false;
+
+                        inputField.textViewport = textAreaGo.GetComponent<RectTransform>();
+                        inputField.textComponent = inTxt;
+                        inputField.placeholder = phTxt;
+                    }
+
                     return go.transform;
 
                 case "scroll":
@@ -519,12 +601,24 @@ namespace Editor.UIBaker
                     GameObject tLblGo = CreateChildRect(go, "Label", Vector2.zero, Vector2.one);
                     RectTransform tLblRect = tLblGo.GetComponent<RectTransform>();
                     tLblRect.offsetMin = new Vector2(boxSize + 10, 0);
-                    TextMeshProUGUI tLblTxt = tLblGo.AddComponent<TextMeshProUGUI>();
-                    tLblTxt.text = nodeData.text;
-                    tLblTxt.color = fontColor;
-                    tLblTxt.fontSize = fontSize;
-                    tLblTxt.alignment = TextAlignmentOptions.MidlineLeft;
-                    tLblTxt.enableWordWrapping = false;
+
+                    if (useLegacyText)
+                    {
+                        Text tLblTxt = tLblGo.AddComponent<Text>();
+                        tLblTxt.text = nodeData.text;
+                        tLblTxt.color = fontColor;
+                        tLblTxt.fontSize = fontSize;
+                        tLblTxt.alignment = TextAnchor.MiddleLeft;
+                    }
+                    else
+                    {
+                        TextMeshProUGUI tLblTxt = tLblGo.AddComponent<TextMeshProUGUI>();
+                        tLblTxt.text = nodeData.text;
+                        tLblTxt.color = fontColor;
+                        tLblTxt.fontSize = fontSize;
+                        tLblTxt.alignment = TextAlignmentOptions.MidlineLeft;
+                        tLblTxt.enableWordWrapping = false;
+                    }
 
                     toggle.targetGraphic = tBgImg;
                     toggle.graphic = checkImg;
@@ -538,12 +632,14 @@ namespace Editor.UIBaker
                     Image sBgImg = sBgGo.AddComponent<Image>();
                     sBgImg.color = bgColor;
 
-                    GameObject fillAreaGo = CreateChildRect(go, "Fill Area", Vector2.zero, Vector2.one, new Vector2(5, 0), new Vector2(-15, 0));
+                    GameObject fillAreaGo = CreateChildRect(go, "Fill Area", Vector2.zero, Vector2.one,
+                        new Vector2(5, 0), new Vector2(-15, 0));
                     GameObject fillGo = CreateChildRect(fillAreaGo, "Fill", Vector2.zero, Vector2.one);
                     Image fillImg = fillGo.AddComponent<Image>();
                     fillImg.color = fontColor;
 
-                    GameObject handleAreaGo = CreateChildRect(go, "Handle Slide Area", Vector2.zero, Vector2.one, new Vector2(10, 0), new Vector2(-10, 0));
+                    GameObject handleAreaGo = CreateChildRect(go, "Handle Slide Area", Vector2.zero, Vector2.one,
+                        new Vector2(10, 0), new Vector2(-10, 0));
                     GameObject handleGo = CreateChildRect(handleAreaGo, "Handle", Vector2.zero, Vector2.one);
                     RectTransform handleRect = handleGo.GetComponent<RectTransform>();
                     handleRect.sizeDelta = new Vector2(20, 0);
@@ -558,15 +654,9 @@ namespace Editor.UIBaker
                 case "dropdown":
                     Image dBgImg = go.AddComponent<Image>();
                     dBgImg.color = bgColor;
-                    TMP_Dropdown dropdown = go.AddComponent<TMP_Dropdown>();
 
-                    GameObject dLblGo = CreateChildRect(go, "Label", Vector2.zero, Vector2.one, new Vector2(10, 0), new Vector2(-30, 0));
-                    TextMeshProUGUI dLblTxt = dLblGo.AddComponent<TextMeshProUGUI>();
-                    dLblTxt.color = fontColor;
-                    dLblTxt.fontSize = fontSize;
-                    dLblTxt.alignment = TextAlignmentOptions.MidlineLeft;
-                    dLblTxt.enableWordWrapping = false;
-
+                    GameObject dLblGo = CreateChildRect(go, "Label", Vector2.zero, Vector2.one, new Vector2(10, 0),
+                        new Vector2(-30, 0));
                     GameObject arrowGo = CreateChildRect(go, "Arrow", new Vector2(1, 0.5f), new Vector2(1, 0.5f));
                     RectTransform arrowRect = arrowGo.GetComponent<RectTransform>();
                     arrowRect.sizeDelta = new Vector2(20, 20);
@@ -591,7 +681,8 @@ namespace Editor.UIBaker
                     dViewportGo.AddComponent<Image>().color = Color.white;
                     dViewportGo.AddComponent<Mask>();
 
-                    GameObject dContentGo = CreateChildRect(dViewportGo, "Content", new Vector2(0, 1), new Vector2(1, 1));
+                    GameObject dContentGo =
+                        CreateChildRect(dViewportGo, "Content", new Vector2(0, 1), new Vector2(1, 1));
                     RectTransform dContentRect = dContentGo.GetComponent<RectTransform>();
                     dContentRect.pivot = new Vector2(0.5f, 1);
                     dContentRect.sizeDelta = new Vector2(0, 28);
@@ -605,37 +696,77 @@ namespace Editor.UIBaker
                     Image itemBgImg = itemBgGo.AddComponent<Image>();
                     itemBgImg.color = Color.white;
 
-                    GameObject itemCheckGo = CreateChildRect(itemGo, "Item Checkmark", new Vector2(0, 0.5f), new Vector2(0, 0.5f));
+                    GameObject itemCheckGo = CreateChildRect(itemGo, "Item Checkmark", new Vector2(0, 0.5f),
+                        new Vector2(0, 0.5f));
                     RectTransform itemCheckRect = itemCheckGo.GetComponent<RectTransform>();
                     itemCheckRect.sizeDelta = new Vector2(20, 20);
                     itemCheckRect.anchoredPosition = new Vector2(15, 0);
                     Image itemCheckImg = itemCheckGo.AddComponent<Image>();
                     itemCheckImg.color = Color.black;
 
-                    GameObject itemLblGo = CreateChildRect(itemGo, "Item Label", Vector2.zero, Vector2.one, new Vector2(30, 0), new Vector2(-10, 0));
-                    TextMeshProUGUI itemLblTxt = itemLblGo.AddComponent<TextMeshProUGUI>();
-                    itemLblTxt.color = Color.black;
-                    itemLblTxt.fontSize = fontSize;
-                    itemLblTxt.alignment = TextAlignmentOptions.MidlineLeft;
-                    itemLblTxt.enableWordWrapping = false;
+                    GameObject itemLblGo = CreateChildRect(itemGo, "Item Label", Vector2.zero, Vector2.one,
+                        new Vector2(30, 0), new Vector2(-10, 0));
 
                     itemToggle.targetGraphic = itemBgImg;
                     itemToggle.graphic = itemCheckImg;
-
                     tempScroll.viewport = dViewportGo.GetComponent<RectTransform>();
                     tempScroll.content = dContentRect;
 
-                    dropdown.targetGraphic = dBgImg;
-                    dropdown.template = templateRect;
-                    dropdown.captionText = dLblTxt;
-                    dropdown.itemText = itemLblTxt;
-
-                    if (nodeData.options != null && nodeData.options.Count > 0)
+                    if (useLegacyText)
                     {
-                        dropdown.ClearOptions();
-                        List<TMP_Dropdown.OptionData> optList = new List<TMP_Dropdown.OptionData>();
-                        foreach (var opt in nodeData.options) optList.Add(new TMP_Dropdown.OptionData(opt));
-                        dropdown.AddOptions(optList);
+                        Dropdown dropdown = go.AddComponent<Dropdown>();
+
+                        Text dLblTxt = dLblGo.AddComponent<Text>();
+                        dLblTxt.color = fontColor;
+                        dLblTxt.fontSize = fontSize;
+                        dLblTxt.alignment = TextAnchor.MiddleLeft;
+
+                        Text itemLblTxt = itemLblGo.AddComponent<Text>();
+                        itemLblTxt.color = Color.black;
+                        itemLblTxt.fontSize = fontSize;
+                        itemLblTxt.alignment = TextAnchor.MiddleLeft;
+
+                        dropdown.targetGraphic = dBgImg;
+                        dropdown.template = templateRect;
+                        dropdown.captionText = dLblTxt;
+                        dropdown.itemText = itemLblTxt;
+
+                        if (nodeData.options != null && nodeData.options.Count > 0)
+                        {
+                            dropdown.ClearOptions();
+                            List<Dropdown.OptionData> optList = new List<Dropdown.OptionData>();
+                            foreach (var opt in nodeData.options) optList.Add(new Dropdown.OptionData(opt));
+                            dropdown.AddOptions(optList);
+                        }
+                    }
+                    else
+                    {
+                        TMP_Dropdown dropdown = go.AddComponent<TMP_Dropdown>();
+
+                        TextMeshProUGUI dLblTxt = dLblGo.AddComponent<TextMeshProUGUI>();
+                        dLblTxt.color = fontColor;
+                        dLblTxt.fontSize = fontSize;
+                        dLblTxt.alignment = TextAlignmentOptions.MidlineLeft;
+                        dLblTxt.enableWordWrapping = false;
+
+                        TextMeshProUGUI itemLblTxt = itemLblGo.AddComponent<TextMeshProUGUI>();
+                        itemLblTxt.color = Color.black;
+                        itemLblTxt.fontSize = fontSize;
+                        itemLblTxt.alignment = TextAlignmentOptions.MidlineLeft;
+                        itemLblTxt.enableWordWrapping = false;
+
+                        dropdown.targetGraphic = dBgImg;
+                        dropdown.template = templateRect;
+                        dropdown.captionText = dLblTxt;
+                        dropdown.itemText = itemLblTxt;
+
+                        if (nodeData.options != null && nodeData.options.Count > 0)
+                        {
+                            dropdown.ClearOptions();
+                            List<TMP_Dropdown.OptionData> optList = new List<TMP_Dropdown.OptionData>();
+                            foreach (var opt in nodeData.options) optList.Add(new TMP_Dropdown.OptionData(opt));
+                            dropdown.AddOptions(optList);
+                        }
                     }
 
                     return go.transform;
@@ -663,7 +794,25 @@ namespace Editor.UIBaker
             }
         }
 
-        private GameObject CreateChildRect(GameObject parent, string name, Vector2 anchorMin, Vector2 anchorMax, Vector2? offsetMin = null, Vector2? offsetMax = null)
+        private TextAnchor ParseLegacyTextAlign(string alignStr)
+        {
+            if (string.IsNullOrEmpty(alignStr)) return TextAnchor.MiddleCenter;
+            switch (alignStr.ToLower())
+            {
+                case "left":
+                case "start":
+                    return TextAnchor.MiddleLeft;
+                case "right":
+                case "end":
+                    return TextAnchor.MiddleRight;
+                case "center":
+                default:
+                    return TextAnchor.MiddleCenter;
+            }
+        }
+
+        private GameObject CreateChildRect(GameObject parent, string name, Vector2 anchorMin, Vector2 anchorMax,
+            Vector2? offsetMin = null, Vector2? offsetMax = null)
         {
             GameObject go = new GameObject(name);
             go.transform.SetParent(parent.transform, false);
